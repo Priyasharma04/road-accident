@@ -1,19 +1,14 @@
 import cv2
 import os
+from collections import defaultdict
 from ultralytics import YOLO
 
 from trajectory.history import track_history
 from trajectory.velocity import get_velocity
 from trajectory.predictor import predict_future
 from trajectory.ttc import calculate_distance, calculate_ttc
-
-from lanes.lanes import assign_lane, draw_lanes
 from risk.severity import get_severity
 
-
-# =========================
-# CONFIG
-# =========================
 
 MODEL_PATH = "weights/yolo11m.pt"
 VIDEO_PATH = "videos/test.mp4"
@@ -21,25 +16,18 @@ OUTPUT_PATH = "outputs/result.mp4"
 
 PREDICTION_SECONDS = 2.0
 
-# Close-distance fallback thresholds in pixels
-# Adjust according to video resolution if needed
 WARNING_DISTANCE = 160
 DANGER_DISTANCE = 90
+STATIONARY_SPEED = 8
+
+PAIR_HISTORY_FRAMES = 5
+PAIR_CONFIRM_COUNT = 3
 
 PERSON = 0
+VEHICLES = {1, 2, 3, 5, 7}
 
-VEHICLES = {
-    1,  # bicycle
-    2,  # car
-    3,  # motorcycle
-    5,  # bus
-    7   # truck
-}
+pair_history = defaultdict(list)
 
-
-# =========================
-# HELPERS
-# =========================
 
 def bbox_overlap_or_close(box1, box2, margin=30):
     x1, y1, x2, y2 = box1
@@ -66,9 +54,28 @@ def upgrade_status(old_status, new_status):
     return old_status
 
 
-# =========================
-# SETUP
-# =========================
+def get_speed(velocity):
+    vx, vy = velocity
+    return (vx ** 2 + vy ** 2) ** 0.5
+
+
+def confirm_risk(pair_key, instant_status):
+    pair_history[pair_key].append(instant_status)
+
+    if len(pair_history[pair_key]) > PAIR_HISTORY_FRAMES:
+        pair_history[pair_key].pop(0)
+
+    danger_count = pair_history[pair_key].count("danger")
+    warning_count = pair_history[pair_key].count("warning")
+
+    if danger_count >= PAIR_CONFIRM_COUNT:
+        return "danger"
+
+    if danger_count + warning_count >= PAIR_CONFIRM_COUNT:
+        return "warning"
+
+    return "safe"
+
 
 os.makedirs("outputs", exist_ok=True)
 
@@ -95,17 +102,11 @@ out = cv2.VideoWriter(
 )
 
 
-# =========================
-# MAIN LOOP
-# =========================
-
 while True:
     ret, frame = cap.read()
 
     if not ret:
         break
-
-    draw_lanes(frame)
 
     results = model.track(
         frame,
@@ -132,12 +133,9 @@ while True:
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            # For CCTV road view, bottom-center is better than bbox center
             cx = (x1 + x2) // 2
             cy = y2
             point = (cx, cy)
-
-            lane = assign_lane(point)
 
             track_history[track_id].append(point)
 
@@ -189,14 +187,9 @@ while True:
                 "future": future_point,
                 "velocity": (vx, vy),
                 "bbox": (x1, y1, x2, y2),
-                "lane": lane,
                 "status": "safe",
                 "ttc": None
             }
-
-    # =========================
-    # COLLISION / RISK CHECK
-    # =========================
 
     ids = list(objects.keys())
 
@@ -212,16 +205,17 @@ while True:
             obj1 = objects[id1]
             obj2 = objects[id2]
 
-            same_lane = (
-                obj1["lane"] is not None
-                and obj1["lane"] == obj2["lane"]
-            )
+            speed1 = get_speed(obj1["velocity"])
+            speed2 = get_speed(obj2["velocity"])
+
+            if speed1 < STATIONARY_SPEED and speed2 < STATIONARY_SPEED:
+                continue
 
             person_involved = (
                 obj1["class"] == PERSON
                 or obj2["class"] == PERSON
             )
-                        # Ignore human-human interactions
+
             both_person = (
                 obj1["class"] == PERSON
                 and obj2["class"] == PERSON
@@ -229,6 +223,7 @@ while True:
 
             if both_person:
                 continue
+
             current_distance = calculate_distance(
                 obj1["point"],
                 obj2["point"]
@@ -250,24 +245,12 @@ while True:
 
             status = get_severity(ttc)
 
-            # Lane is only a boost, not hard filter
-            if same_lane and current_distance < WARNING_DISTANCE:
-                status = upgrade_status(status, "warning")
-
-            if same_lane and current_distance < DANGER_DISTANCE:
-                status = upgrade_status(status, "danger")
-
-            # Person + vehicle gets stricter treatment
             if person_involved and current_distance < WARNING_DISTANCE + 40:
                 status = upgrade_status(status, "warning")
 
             if person_involved and current_distance < DANGER_DISTANCE + 30:
                 status = upgrade_status(status, "danger")
 
-            ######hehehehehe
-            # Close bbox / overlapping bbox fallback
-            # near_overlap = warning
-            # actual_overlap = danger/crash
             near_overlap = bbox_overlap_or_close(
                 obj1["bbox"],
                 obj2["bbox"],
@@ -280,25 +263,29 @@ while True:
                 margin=0
             )
 
-            if near_overlap:
+            moving_pair = (
+                speed1 >= STATIONARY_SPEED
+                or speed2 >= STATIONARY_SPEED
+            )
+
+            if near_overlap and moving_pair:
                 status = upgrade_status(status, "warning")
 
-            if actual_overlap:
+            if actual_overlap and moving_pair:
                 status = upgrade_status(status, "danger")
 
-            if current_distance < 70:
+            if current_distance < 70 and moving_pair:
                 status = upgrade_status(status, "danger")
 
-            # If neither same lane nor person involved nor close,
-            # then don't alert for different-lane far objects
             if (
-                not same_lane
-                and not person_involved
+                not person_involved
                 and not near_overlap
                 and current_distance > WARNING_DISTANCE
             ):
                 status = "safe"
-            
+
+            pair_key = tuple(sorted((id1, id2)))
+            status = confirm_risk(pair_key, status)
 
             if status == "danger":
                 obj1["status"] = upgrade_status(obj1["status"], "danger")
@@ -307,9 +294,7 @@ while True:
                 obj1["ttc"] = ttc if ttc != float("inf") else None
                 obj2["ttc"] = ttc if ttc != float("inf") else None
 
-                danger_pairs.append(
-                    f"{id1}-{id2}"
-                )
+                danger_pairs.append(f"{id1}-{id2}")
 
             elif status == "warning":
                 obj1["status"] = upgrade_status(obj1["status"], "warning")
@@ -318,13 +303,7 @@ while True:
                 obj1["ttc"] = ttc if ttc != float("inf") else None
                 obj2["ttc"] = ttc if ttc != float("inf") else None
 
-                warning_pairs.append(
-                    f"{id1}-{id2}"
-                )
-
-    # =========================
-    # ALERT TEXT
-    # =========================
+                warning_pairs.append(f"{id1}-{id2}")
 
     y_text = 50
 
@@ -352,10 +331,6 @@ while True:
         )
         y_text += 40
 
-    # =========================
-    # DRAW BOXES
-    # =========================
-
     for track_id, obj in objects.items():
 
         x1, y1, x2, y2 = obj["bbox"]
@@ -377,11 +352,6 @@ while True:
         )
 
         label = f"ID:{track_id} {status}"
-
-        if obj["lane"] is not None:
-            label += f" {obj['lane']}"
-        else:
-            label += " NO_LANE"
 
         if obj["ttc"] is not None:
             label += f" TTC:{obj['ttc']:.1f}s"
