@@ -1,0 +1,10 @@
+venv
+__pycache__
+.git
+outputs
+videos
+*.mp4
+*.avi
+*.mov
+*.pt
+weights

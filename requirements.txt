@@ -1,0 +1,10 @@
+ultralytics
+opencv-python
+numpy
+scipy
+lapx
+filterpy
+shapely
+supervision
+torch
+torchvision

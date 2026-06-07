@@ -1,0 +1,13 @@
+venv/
+outputs/
+videos/
+
+__pycache__/
+*.pyc
+
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
+weights/
