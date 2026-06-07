@@ -1,12 +1,13 @@
-def get_velocity(history):
+def get_velocity(history, fps=30, window=5):
+    if len(history) < window:
+        return 0.0, 0.0
 
-    if len(history) < 5:
-        return (0, 0)
-
-    x1, y1 = history[-5]
+    x1, y1 = history[-window]
     x2, y2 = history[-1]
 
-    vx = (x2 - x1) / 4
-    vy = (y2 - y1) / 4
+    dt = (window - 1) / fps
 
-    return (vx, vy)
+    vx = (x2 - x1) / dt
+    vy = (y2 - y1) / dt
+
+    return vx, vy

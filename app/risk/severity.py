@@ -1,5 +1,4 @@
 def get_severity(ttc):
-
     if ttc <= 2:
         return "danger"
 

@@ -1,5 +1,4 @@
 def get_risk_score(ttc):
-
     if ttc <= 2:
         return 90
 
